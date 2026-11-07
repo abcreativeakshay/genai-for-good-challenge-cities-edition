@@ -10,3 +10,9 @@ data/*.md
 data/*.ipynb
 data/*.json
 data/sources/
+# Challenge data and generated artefacts must NEVER be committed:
+# Test/Train materials, source files, derived contexts/answers and
+# submissions are local-only (see src/README.md).
+data/
+submissions/
+*.jsonl
