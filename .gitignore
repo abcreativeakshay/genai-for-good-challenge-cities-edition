@@ -5,3 +5,8 @@ data/*.zip
 data/*.pdf
 *.log
 .DS_Store
+data/*.csv
+data/*.md
+data/*.ipynb
+data/*.json
+data/sources/
