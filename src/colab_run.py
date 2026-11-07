@@ -2,8 +2,10 @@
 
 This is the ONLY place a generative model is invoked. Exactly one
 model is used -- Qwen3-1.7B via Ollama ("qwen3:1.7b"), the organiser
-baseline from the StarterNotebook -- with exactly ONE chat call per
-question, temperature 0, thinking disabled, seed 42, num_ctx 8192 and
+baseline from the StarterNotebook -- with ONE chat call per question
+(a second call only if the first hits the context-length limit, so
+at most 2 calls per question, well within the 15-call limit),
+temperature 0, thinking disabled, seed 42, num_ctx 32768 and
 num_predict 512 (<= 12,000 generated tokens per question, and in
 practice <= 512). The script asserts the model's parameter count is
 <= 3,000,000,000 before generating anything, exactly as the
@@ -53,7 +55,12 @@ import urllib.request
 MODEL = "qwen3:1.7b"
 MAX_PARAMS = 3_000_000_000
 OLLAMA_URL = os.environ.get("MUNICIPAL_QA_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-NUM_CTX = 8192
+# 32768, not 8192: Q4 (0109ed59) hit done_reason "length" at 8192 even
+# though its excerpts are only ~8k chars -- dense GeoJSON/CSV numbers
+# tokenise to far more tokens than chars/3.5 suggests. A 1.7B Q4 model
+# on a 15 GB T4 has room for a 32k KV cache (~4 GB). If a question
+# still hits "length", generate_one retries once with halved excerpts.
+NUM_CTX = 32768
 NUM_PREDICT = 512
 MAX_GENERATED_TOKENS = 12_000
 SEED = 42
@@ -89,6 +96,11 @@ def ensure_ollama() -> None:
     except (urllib.error.URLError, TimeoutError):
         if not shutil.which("ollama"):
             print("Installing Ollama ...", flush=True)
+            # The Ollama installer needs zstd for extraction (seen on
+            # Colab 2026-11-07: installer failed without it).
+            subprocess.run(
+                ["bash", "-lc", "apt-get update -qq && apt-get install -y -qq zstd || true"],
+                check=False)
             subprocess.run(
                 ["bash", "-lc", "curl -fsSL https://ollama.com/install.sh | sh"],
                 check=True)
@@ -127,31 +139,44 @@ def build_user_prompt(record: dict) -> str:
     parts.append(
         "\nWrite a short answer, then list your evidence as one line per "
         "claim in the form: SOURCE_ID | locator | supported claim\n"
-        "Use only the sources above.")
+        "Each evidence line must start exactly with the SOURCE_ID "
+        "(for example SRC_e8127c3e9140 | page 2 | supported claim), "
+        "with no 'SOURCE' prefix. Use only the sources above.")
     return "\n".join(parts)
 
 
 def parse_evidence(answer: str, record: dict) -> list[str]:
     """Pull 'SRC_... | locator | claim' lines out of the model output.
 
-    Falls back to nothing here -- the fallback (first excerpt source)
-    lives in build_submission.py and is logged there, so this file
-    never invents evidence.
+    The model writes evidence lines as 'SOURCE SRC_... | ...' as well
+    as bare 'SRC_... | ...' (seen in the 2026-11-07 smoke test, where
+    the strict parser extracted 0 of 3 rows' evidence). Accept both,
+    normalising to the bare form. Falls back to nothing here -- the
+    fallback (first excerpt source) lives in build_submission.py and
+    is logged there, so this file never invents evidence.
     """
     evidence: list[str] = []
-    for line in answer.splitlines():
-        line = line.strip().lstrip("- ").strip()
+    for raw in answer.splitlines():
+        line = raw.strip().lstrip("- ").strip()
+        # Strip a leading "SOURCE " / "Source: " prefix, if present.
+        low = line.lower()
+        if low.startswith("source "):
+            line = line[len("source "):].strip()
+        elif low.startswith("source:"):
+            line = line[len("source:"):].strip()
         if line.startswith("SRC_") and line.count("|") >= 2:
             evidence.append(line)
     return evidence
 
 
-def generate_one(record: dict) -> dict:
+def _chat(record: dict, excerpts: list[dict]) -> dict:
+    """One Ollama chat call for a record with the given excerpts."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_prompt(record)},
+        {"role": "user", "content": build_user_prompt(
+            {**record, "excerpts": excerpts})},
     ]
-    response = api("/api/chat", {
+    return api("/api/chat", {
         "model": MODEL,
         "messages": messages,
         "think": False,
@@ -159,19 +184,44 @@ def generate_one(record: dict) -> dict:
         "keep_alive": 0,
         "options": {"temperature": 0, "seed": SEED,
                     "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT},
-    }, timeout=600)
-    assert response.get("done") and response.get("done_reason") == "stop", (
+    }, timeout=900)
+
+
+def generate_one(record: dict) -> dict:
+    """Generate one answer; at most 2 model calls for one question.
+
+    A done_reason of "length" means the context window was exhausted
+    (seen on Q4 at num_ctx 8192). In that case retry once with the
+    excerpts halved (first half + last quarter of the text, so a
+    relevant feature at either end survives) instead of crashing the
+    whole run. The 15-call-per-question limit leaves ample headroom.
+    """
+    response = _chat(record, record["excerpts"])
+    calls = 1
+    if response.get("done_reason") == "length":
+        print(f"  {record['ID']}: context length hit, retrying with halved excerpts",
+              flush=True)
+        halved = []
+        for ex in record["excerpts"]:
+            text = ex["text"]
+            half = len(text) // 2
+            keep = text[:half] + "\n[... middle truncated for context ...]\n" + text[-len(text) // 4:]
+            halved.append({**ex, "text": keep})
+        response = _chat(record, halved)
+        calls = 2
+    assert response.get("done"), (
         f"unexpected Ollama response for {record['ID']}: {response.get('done_reason')}")
     generated = int(response.get("eval_count", 0))
     assert generated <= MAX_GENERATED_TOKENS, (
         f"{generated} generated tokens for {record['ID']} exceeds the 12,000 limit")
     answer = response["message"]["content"].strip()
+    assert answer, f"empty answer for {record['ID']} (done_reason={response.get('done_reason')})"
     return {
         "ID": record["ID"],
         "answer": answer,
         "evidence": parse_evidence(answer, record),
         "generated_tokens": generated,
-        "calls": 1,
+        "calls": calls,
         "model": MODEL,
     }
 
