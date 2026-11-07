@@ -49,6 +49,88 @@ sys.path.insert(0, str(ROOT))
 
 INSUFFICIENT = "I don't have enough information in the provided sources to answer that."
 
+EVIDENCE_LINE = re.compile(r"^\s*-?\s*(?:SOURCE\s+)?SRC_[0-9a-f]+\b.*\|", re.I)
+# The model also echoes the instruction template verbatim inside its
+# prose ("SOURCE_ID | locator | supported claim", sometimes with a
+# page number), and the 512-token cap leaves truncated fragments
+# ("SOURCE", "SOURCE SRC_e8127c"). All of these are filler, not
+# answer text -- drop the whole line. Inline citations mid-sentence
+# ("...(SOURCE SRC_x | page 1 | supported claim)") are left alone;
+# they are real sourcing inside the prose.
+TEMPLATE_LINE = re.compile(
+    r"^\s*-?\s*(?:SOURCE_ID\s*\||SOURCE\s+SRC_[0-9a-f]*\s*$|SOURCE\s*$|SRC_[0-9a-f]*\s*$)",
+    re.I)
+SID_RE = re.compile(r"SRC_[0-9a-f]+")
+GENERIC_CLAIM = re.compile(r"^(supported claim|claim|n/?a\.?)\s*:?\s*$", re.I)
+
+
+def clean_answer(answer: str) -> str:
+    """Strip evidence lines the model appended inside its answer text.
+
+    The model writes its evidence block after the prose; leaving those
+    lines inside the answer section would duplicate the Evidence
+    section and, worse, the 512-token cap often cut the block
+    mid-line. Keep only the prose answer.
+    """
+    kept = []
+    for line in answer.splitlines():
+        if EVIDENCE_LINE.match(line):
+            continue
+        if TEMPLATE_LINE.match(line):
+            continue
+        if line.strip().lower() in ("evidence:", "### evidence", "evidence"):
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+    # Collapse runs of blank lines left by the removal.
+    return re.sub(r"\n{3,}", "\n\n", text) or answer.strip()
+
+
+def clean_evidence(answer: str, evidence: list[str],
+                   allowed_sids: set[str]) -> list[str]:
+    """Normalise the model's evidence lines into real citations.
+
+    What the model actually produced (smoke + full run, Nov 2026):
+    lines like "SOURCE SRC_x | page 2 | supported claim" -- the
+    literal words "supported claim" as the claim, and sometimes the
+    same source repeated page-by-page (up to 20 lines). Those lines
+    carry no claim for the judge to check, so:
+      * drop lines whose SID is not one of the question's listed
+        sources (the model citing a source it was never given);
+      * de-duplicate by SID, keeping the first locator per SID and
+        at most 3 distinct sources;
+      * replace a generic/empty claim with the answer's first
+        sentence (the model's own claim, <= 200 chars) -- the SID
+        and locator stay the model's own, nothing new is invented.
+    Returns [] when nothing usable survives (caller applies fallback).
+    """
+    claim = answer.split("\n")[0].strip()[:200]
+    seen: dict[str, str] = {}
+    for raw in evidence:
+        line = str(raw).strip()
+        if not line:
+            continue
+        m = SID_RE.search(line)
+        if not m:
+            continue
+        sid = m.group(0)
+        if sid not in allowed_sids or sid in seen:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        locator = parts[1] if len(parts) > 1 else sid
+        # Locator sometimes carries a stray " - filename" suffix.
+        locator = re.sub(r"\s+-\s+\S+\.(json|csv|xlsx|ods|pdf|geojson|md|txt|xml|html|gpkg|sqlite|tif|laz|ifc|docx?)$",
+                         "", locator, flags=re.I)
+        raw_claim = parts[2] if len(parts) > 2 else ""
+        # A real claim may be written as 'supported claim: "..."'.
+        raw_claim = re.sub(r"^supported claim\s*:\s*", "", raw_claim, flags=re.I)
+        if not raw_claim or GENERIC_CLAIM.match(raw_claim):
+            raw_claim = claim
+        seen[sid] = f"{sid} | {locator} | {raw_claim}"
+        if len(seen) >= 3:
+            break
+    return list(seen.values())
+
 
 def load_answers(path: Path) -> dict[str, dict]:
     answers: dict[str, dict] = {}
@@ -92,14 +174,23 @@ def build_submission(answers_path: Path, test_csv: Path, contexts_path: Path,
         raise ValueError(f"Unexpected IDs in answers file: {extra[:5]}")
 
     first_source = load_first_sources(contexts_path)
+    allowed = {
+        str(row["ID"]): set(json.loads(row["Source_IDs"]))
+        for _, row in test.iterrows()
+    }
     fallbacks: list[str] = []
+    cleaned_evidence_rows = 0
     chunks = ["# Submission\n"]
     for qid in expected:
         item = answers[qid]
-        answer = str(item["answer"]).strip()
+        answer = clean_answer(str(item["answer"]).strip())
         assert answer, f"Empty answer for {qid}"
         assert not re.search(r"^## ", answer, re.M), f"Invalid answer section for {qid}"
-        evidence = [str(e) for e in item.get("evidence") or []]
+        evidence = clean_evidence(
+            answer, [str(e) for e in item.get("evidence") or []],
+            allowed.get(qid, set()))
+        if evidence:
+            cleaned_evidence_rows += 1
         # Drop empty / placeholder evidence lines.
         evidence = [e.strip() for e in evidence if e.strip()]
         if not evidence:
@@ -126,6 +217,7 @@ def build_submission(answers_path: Path, test_csv: Path, contexts_path: Path,
     return {
         "output": str(output_path),
         "n_questions": len(expected),
+        "n_rows_with_model_evidence": cleaned_evidence_rows,
         "n_fallback_evidence": len(fallbacks),
         "fallback_ids": fallbacks,
         "n_insufficient_answers": sum(
