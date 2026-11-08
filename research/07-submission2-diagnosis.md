@@ -154,7 +154,17 @@ wrong, or abstaining, not merely failing to cite.
   top-values, focus boolean-match swamping, TIFF median slowness.
 - Full contexts rebuild (v2): backed up v1 to
   data/contexts_v1.jsonl + data/contexts_log_v1.json first.
-  [rebuild stats to be filled in when it finishes]
+  Rebuilt 2026-11-08 ~13:22–14:05 IST (~43 min, resumable).
+  Verified: 600/600 entries, IDs match Test.csv exactly and in
+  order, 0 questions with 0 excerpts, max 20,000 chars/Q (budget
+  respected). v1 → v2: total chars 6,394,592 → 9,899,126
+  (avg 10,658 → 16,499/Q); skipped sources 286 → 251;
+  truncated excerpts 1,495 → 1,304; excerpts/Q 4.97 → 5.03.
+  COMPUTED blocks in 851 excerpts, covering 423/600 questions.
+  Note the budget increase mostly bought depth per source, not
+  breadth — skipped sources are concentrated in source-heavy
+  (9+ source) questions; the reserve still guarantees every
+  listed source at least a fragment unless <500 chars remain.
 
 ## Full Colab run — cost and honest expected gain
 
