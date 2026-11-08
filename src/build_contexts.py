@@ -7,8 +7,13 @@ extract them with src.extract, and write one JSONL line per question::
      "excerpts": [{"source_id": ..., "file": ..., "locator_hint": ...,
                    "text": ...}, ...]}
 
-Budget: total excerpt text per question stays under ~12,000
-characters (MAX_CONTEXT_CHARS). Sources are taken in priority order:
+Budget (v2): total excerpt text per question stays under ~20,000
+characters (MAX_CONTEXT_CHARS) -- about 5,000 input tokens, so
+prompt + output (<= 2,048) stays well under the 12,000-token/
+question rule limit. Raised from 12,000 because submission #1
+skipped 286 sources on budget and truncated 1,495 excerpts;
+computed summaries sit at the TOP of each extraction so they
+survive excerpt truncation. Sources are taken in priority order:
 
   0. Analysis / SourceGuide / ReadingGuide files (they summarise a
      case and point at the exact locations to use)
@@ -53,13 +58,19 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.extract import extract_source  # noqa: E402
+from src.extract import extract_source, focus_tokens  # noqa: E402
 
-MAX_CONTEXT_CHARS = 12_000
+# Focus-aware re-extraction is only worth it for small files:
+# re-scanning a 136 MB CSV once per question would dominate
+# the build. Large files keep their generic cached extraction
+# (which already carries full-file computed summaries).
+FOCUS_FILE_SIZE_LIMIT = 10_000_000
+
+MAX_CONTEXT_CHARS = 20_000
 MIN_FRAGMENT_CHARS = 500
 # Per-source extraction cap: a single source never contributes more
 # than this many characters before the per-question budget is applied.
-PER_SOURCE_MAX_CHARS = 20_000
+PER_SOURCE_MAX_CHARS = 30_000
 # Per-excerpt cap inside a question: with ~5.5 sources listed per
 # question and a 12,000-char budget, letting one source take the
 # whole budget starves the rest (the first build averaged only 3.5
@@ -69,7 +80,7 @@ PER_SOURCE_MAX_CHARS = 20_000
 # gets at least a fragment.
 
 
-PER_EXCERPT_MAX_CHARS = 8_000
+PER_EXCERPT_MAX_CHARS = 10_000
 RESERVE_PER_REMAINING_SOURCE = 500
 
 
@@ -79,9 +90,9 @@ def source_priority(original_file: str, suffix: str) -> int:
         return 0
     if suffix in (".txt", ".md"):
         return 1
-    if suffix in (".json", ".csv"):
+    if suffix in (".json", ".csv", ".sqlite", ".gpkg"):
         return 2
-    if suffix == ".geojson":
+    if suffix == ".geojson" or suffix in (".tif", ".tiff"):
         return 3
     if suffix in (".xlsx", ".ods"):
         return 4
@@ -134,6 +145,8 @@ def build_contexts(input_csv: Path, manifest_csv: Path, sources_dir: Path,
                 stats["questions_skipped_done"] += 1
                 continue
             source_ids = parse_source_ids(row["Source_IDs"])
+            focus = focus_tokens(str(row.get("Question", "")) + " "
+                                 + str(row.get("Context", "")))
 
             # Order sources by priority, then by file size (small first).
             def sort_key(sid: str):
@@ -150,15 +163,27 @@ def build_contexts(input_csv: Path, manifest_csv: Path, sources_dir: Path,
             skipped: list[dict] = []
             truncated: list[str] = []
             for j, sid in enumerate(ordered):
-                if sid not in cache:
-                    info = by_id.get(sid)
-                    if info is None:
-                        skipped.append({"source_id": sid,
-                                        "reason": "not in SourceManifest.csv"})
-                        continue
-                    cache[sid] = extract_source(sid, info, sources_dir,
-                                                max_chars=PER_SOURCE_MAX_CHARS)
-                ext = cache[sid]
+                info = by_id.get(sid)
+                if info is None:
+                    skipped.append({"source_id": sid,
+                                    "reason": "not in SourceManifest.csv"})
+                    continue
+                # Focus-aware extraction for small files: rows/items/
+                # features matching the question's tokens are shown
+                # first. Large files use the generic cached extraction.
+                size = int(info.get("Bytes") or 0)
+                if focus and 0 < size < FOCUS_FILE_SIZE_LIMIT:
+                    cache_key = (sid, frozenset(focus))
+                    if cache_key not in cache:
+                        cache[cache_key] = extract_source(
+                            sid, info, sources_dir,
+                            max_chars=PER_SOURCE_MAX_CHARS, focus=focus)
+                    ext = cache[cache_key]
+                else:
+                    if sid not in cache:
+                        cache[sid] = extract_source(sid, info, sources_dir,
+                                                    max_chars=PER_SOURCE_MAX_CHARS)
+                    ext = cache[sid]
                 remaining = MAX_CONTEXT_CHARS - used_chars
                 if remaining < MIN_FRAGMENT_CHARS:
                     skipped.append({"source_id": sid, "file": ext["file"],
