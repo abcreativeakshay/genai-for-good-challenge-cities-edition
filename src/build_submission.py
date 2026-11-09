@@ -32,6 +32,17 @@ Usage:
                                    [--test data/Test.csv]
                                    [--contexts data/contexts.jsonl]
                                    [--output submissions/Submission.md]
+
+Slim build (for the 256 KiB scoring-failure tip from the Zindi forum,
+2026-11-09 -- a 398 KiB file failed during scoring once, though the
+earlier ~415 KiB file scored fine, so size is a suspect, not proven):
+    python -m src.build_submission --claim-cap 50 --max-evidence-lines 2 \
+        --answer-cap 600 --strip-bold --output submissions/Submission_slim.md
+Under-256-KiB build (caps answer prose at ~300 chars -- cuts 314 of
+600 answers, so it trades correctness risk for size; use only if a
+same-size file fails scoring again):
+    python -m src.build_submission --claim-cap 40 --max-evidence-lines 2 \
+        --answer-cap 300 --strip-bold --output submissions/Submission_slim256.md
 """
 
 from __future__ import annotations
@@ -64,7 +75,7 @@ SID_RE = re.compile(r"SRC_[0-9a-f]+")
 GENERIC_CLAIM = re.compile(r"^(supported claim|claim|n/?a\.?)\s*:?\s*$", re.I)
 
 
-def clean_answer(answer: str) -> str:
+def clean_answer(answer: str, strip_bold: bool = False) -> str:
     """Strip evidence lines the model appended inside its answer text.
 
     The model writes its evidence block after the prose; leaving those
@@ -83,11 +94,32 @@ def clean_answer(answer: str) -> str:
         kept.append(line)
     text = "\n".join(kept).strip()
     # Collapse runs of blank lines left by the removal.
-    return re.sub(r"\n{3,}", "\n\n", text) or answer.strip()
+    text = re.sub(r"\n{3,}", "\n\n", text) or answer.strip()
+    if strip_bold:
+        text = text.replace("**", "")
+    return text
+
+
+def trim_answer(answer: str, cap: int) -> tuple[str, bool]:
+    """Cap a long answer at ~cap chars, cutting at a sentence end.
+
+    Only used by the --slim build. Cuts at the last sentence boundary
+    before the cap (if one exists past the halfway point), so the
+    trimmed answer still ends on a complete sentence. Returns the
+    (possibly trimmed) answer and whether it was trimmed.
+    """
+    if len(answer) <= cap:
+        return answer, False
+    cut = answer[:cap]
+    idx = cut.rfind(". ")
+    if idx > cap // 2:
+        cut = cut[:idx + 1]
+    return cut.strip(), True
 
 
 def clean_evidence(answer: str, evidence: list[str],
-                   allowed_sids: set[str]) -> list[str]:
+                   allowed_sids: set[str], claim_cap: int = 200,
+                   max_lines: int = 3) -> list[str]:
     """Normalise the model's evidence lines into real citations.
 
     What the model actually produced (smoke + full run, Nov 2026):
@@ -100,11 +132,11 @@ def clean_evidence(answer: str, evidence: list[str],
       * de-duplicate by SID, keeping the first locator per SID and
         at most 3 distinct sources;
       * replace a generic/empty claim with the answer's first
-        sentence (the model's own claim, <= 200 chars) -- the SID
-        and locator stay the model's own, nothing new is invented.
+        sentence (the model's own claim, capped at claim_cap) -- the
+        SID and locator stay the model's own, nothing new is invented.
     Returns [] when nothing usable survives (caller applies fallback).
     """
-    claim = answer.split("\n")[0].strip()[:200]
+    claim = answer.split("\n")[0].strip()[:claim_cap]
     seen: dict[str, str] = {}
     for raw in evidence:
         line = str(raw).strip()
@@ -127,7 +159,7 @@ def clean_evidence(answer: str, evidence: list[str],
         if not raw_claim or GENERIC_CLAIM.match(raw_claim):
             raw_claim = claim
         seen[sid] = f"{sid} | {locator} | {raw_claim}"
-        if len(seen) >= 3:
+        if len(seen) >= max_lines:
             break
     return list(seen.values())
 
@@ -158,7 +190,10 @@ def load_first_sources(contexts_path: Path) -> dict[str, str]:
 
 
 def build_submission(answers_path: Path, test_csv: Path, contexts_path: Path,
-                     output_path: Path) -> dict:
+                     output_path: Path, claim_cap: int = 200,
+                     max_evidence_lines: int = 3,
+                     answer_cap: int | None = None,
+                     strip_bold: bool = False) -> dict:
     test = pd.read_csv(test_csv, keep_default_na=False)
     expected = test["ID"].astype(str).tolist()
     answers = load_answers(answers_path)
@@ -180,15 +215,20 @@ def build_submission(answers_path: Path, test_csv: Path, contexts_path: Path,
     }
     fallbacks: list[str] = []
     cleaned_evidence_rows = 0
+    trimmed_answers = 0
     chunks = ["# Submission\n"]
     for qid in expected:
         item = answers[qid]
-        answer = clean_answer(str(item["answer"]).strip())
+        answer = clean_answer(str(item["answer"]).strip(), strip_bold=strip_bold)
+        if answer_cap is not None:
+            answer, was_trimmed = trim_answer(answer, answer_cap)
+            trimmed_answers += int(was_trimmed)
         assert answer, f"Empty answer for {qid}"
         assert not re.search(r"^## ", answer, re.M), f"Invalid answer section for {qid}"
         evidence = clean_evidence(
             answer, [str(e) for e in item.get("evidence") or []],
-            allowed.get(qid, set()))
+            allowed.get(qid, set()), claim_cap=claim_cap,
+            max_lines=max_evidence_lines)
         if evidence:
             cleaned_evidence_rows += 1
         # Drop empty / placeholder evidence lines.
@@ -197,7 +237,7 @@ def build_submission(answers_path: Path, test_csv: Path, contexts_path: Path,
             # Fallback ONLY when the model cited nothing: cite the
             # first excerpt source for the question. Logged, not hidden.
             src = first_source.get(qid, "")
-            claim = answer.split("\n")[0][:200].strip() if answer != INSUFFICIENT else INSUFFICIENT
+            claim = answer.split("\n")[0][:claim_cap].strip() if answer != INSUFFICIENT else INSUFFICIENT
             if src:
                 evidence = [f"{src} | {src} | {claim}"]
             else:
@@ -216,9 +256,12 @@ def build_submission(answers_path: Path, test_csv: Path, contexts_path: Path,
     output_path.write_text(text, encoding="utf-8")
     return {
         "output": str(output_path),
+        "output_bytes": output_path.stat().st_size,
+        "output_kib": round(output_path.stat().st_size / 1024, 1),
         "n_questions": len(expected),
         "n_rows_with_model_evidence": cleaned_evidence_rows,
         "n_fallback_evidence": len(fallbacks),
+        "n_trimmed_answers": trimmed_answers,
         "fallback_ids": fallbacks,
         "n_insufficient_answers": sum(
             1 for qid in expected if str(answers[qid]["answer"]).strip() == INSUFFICIENT),
@@ -235,9 +278,21 @@ def main() -> None:
     parser.add_argument("--test", default="data/Test.csv")
     parser.add_argument("--contexts", default="data/contexts.jsonl")
     parser.add_argument("--output", default="submissions/Submission.md")
+    parser.add_argument("--claim-cap", type=int, default=200,
+                        help="max chars of the claim in an evidence line")
+    parser.add_argument("--max-evidence-lines", type=int, default=3,
+                        help="max evidence lines kept per question")
+    parser.add_argument("--answer-cap", type=int, default=None,
+                        help="cap answer prose at ~N chars (sentence boundary)")
+    parser.add_argument("--strip-bold", action="store_true",
+                        help="remove ** markers from answer prose")
     args = parser.parse_args()
     stats = build_submission(Path(args.answers), Path(args.test),
-                             Path(args.contexts), Path(args.output))
+                             Path(args.contexts), Path(args.output),
+                             claim_cap=args.claim_cap,
+                             max_evidence_lines=args.max_evidence_lines,
+                             answer_cap=args.answer_cap,
+                             strip_bold=args.strip_bold)
     print(json.dumps(stats, indent=2))
 
 
